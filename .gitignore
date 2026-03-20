@@ -1,0 +1,13 @@
+# Environment
+.env
+venv/
+
+# Data (local only)
+data/
+collected_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
