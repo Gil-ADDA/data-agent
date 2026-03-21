@@ -2,9 +2,15 @@
 .env
 venv/
 
-# Data (local only)
-data/
+# Data — heavy/sensitive files ignored
+data/db/
+data/pdf/
+data/json/
 collected_data/
+
+# Data — tracked (exports & source xlsx)
+# data/csv/ ← tracked
+# data/exports/ ← tracked
 
 # Python
 __pycache__/

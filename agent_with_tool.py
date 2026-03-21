@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 import requests
+import pandas as pd
 from datetime import datetime
 from groq import Groq
 from dotenv import load_dotenv
@@ -111,6 +112,36 @@ def list_data_files() -> str:
     result["db_tables"] = [r[0] for r in cursor.fetchall()]
     conn.close()
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+def import_xlsx(filename: str, table_name: str = None, header_row: int = 0) -> str:
+    """Import an xlsx/csv file from data/csv/ directly into SQLite"""
+    try:
+        import warnings
+        warnings.filterwarnings('ignore')
+        CSV_DIR = os.path.join(DATA_DIR, "csv")
+        files = os.listdir(CSV_DIR)
+        match = next((f for f in files if filename.lower() in f.lower()), None)
+        if not match:
+            return f"File not found. Available: {', '.join(files)}"
+        path = os.path.join(CSV_DIR, match)
+        ext = os.path.splitext(match)[1].lower()
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(path, header=header_row)
+        else:
+            df = pd.read_csv(path, header=header_row)
+        # Clean up
+        df = df.dropna(how='all').reset_index(drop=True)
+        df = df.loc[:, ~df.columns.astype(str).str.startswith('Unnamed')]
+        df.columns = [str(c).strip() for c in df.columns]
+        # Table name = filename without extension if not provided
+        if not table_name:
+            table_name = os.path.splitext(match)[0].lower().replace(" ", "_").replace("-", "_")[:40]
+        conn = sqlite3.connect(DB_PATH)
+        df.to_sql(table_name, conn, if_exists='replace', index=False)
+        conn.close()
+        return f"Imported {len(df)} rows, {len(df.columns)} columns into table '{table_name}'\nColumns: {list(df.columns)}"
+    except Exception as e:
+        return f"Error importing file: {str(e)}"
 
 def export_table(table_name: str, fmt: str = "json") -> str:
     """Export a DB table to data/exports/ as JSON or CSV"""
@@ -257,12 +288,16 @@ TOOL_REGISTRY = {
         "fn": lambda args: export_table(args["table_name"], args.get("format", "json")),
         "desc": 'export_table(table_name, format="json"|"csv") → Export DB table to data/exports/'
     },
+    "import_xlsx": {
+        "fn": lambda args: import_xlsx(args["filename"], args.get("table_name"), args.get("header_row", 0)),
+        "desc": 'import_xlsx(filename, table_name, header_row=0) → Import xlsx/csv from data/csv/ into SQLite'
+    },
 }
 
 
 # ── ReAct Agent loop ──────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a data collection and analysis agent.
+SYSTEM_PROMPT = """You are a data collection and analysis agent with access to a local SQLite database and the web.
 
 Available tools:
 {tools}
@@ -273,29 +308,59 @@ To use a tool, output EXACTLY this JSON (nothing before or after):
 When you have finished and have an answer for the user, output EXACTLY:
 {{"done": true, "answer": "your final answer here"}}
 
-Rules:
+## Decision rules — follow this order every time:
+
+1. ALWAYS call list_tables first if the request is about data, companies, funds, or analysis.
+2. If relevant tables exist → use query_db to answer from the database. Do NOT search the web.
+3. Only use search_web or fetch_url if:
+   - The database has no relevant data, AND
+   - The user explicitly asks for new/live information from the internet.
+4. After fetching new data from the web → always save it with save_to_db for future use.
+
+## Output rules:
 - Output ONLY valid JSON, one object per response
 - Never explain yourself before calling a tool
-- After getting tool results, decide the next step
-- Save structured data with save_to_db so the user can query it later
+- After getting tool results, decide the next step based on the rules above
 """.strip()
 
 
 def run_agent(user_request: str) -> str:
+    import time
     tools_desc = "\n".join(f"  - {v['desc']}" for v in TOOL_REGISTRY.values())
     system = SYSTEM_PROMPT.format(tools=tools_desc)
 
+    # Inject current DB state so agent knows what's available before step 1
+    db_context = list_tables()
+    if db_context and db_context != "Database is empty":
+        db_hint = f"[Current database tables]\n{db_context}"
+    else:
+        db_hint = "[Database is currently empty]"
+
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": user_request}
+        {"role": "user", "content": f"{db_hint}\n\nUser request: {user_request}"}
     ]
 
-    for step in range(15):
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0
-        )
+    tool_call_counts = {}  # track how many times each tool is called
+
+    for step in range(10):
+        # Retry loop for rate limit
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    temperature=0
+                )
+                break
+            except Exception as e:
+                if "429" in str(e) and attempt < 2:
+                    wait = 15 * (attempt + 1)
+                    print(f"[Rate limit hit — waiting {wait}s...]")
+                    time.sleep(wait)
+                else:
+                    return f"Error: {str(e)}"
+
         raw = response.choices[0].message.content.strip()
 
         # Extract JSON from response
@@ -317,12 +382,19 @@ def run_agent(user_request: str) -> str:
         if tool_name not in TOOL_REGISTRY:
             return f"Unknown tool: {tool_name}"
 
+        # Block repetitive tool calls (max 2 per tool)
+        tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
+        if tool_call_counts[tool_name] > 2:
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"You already used '{tool_name}' {tool_call_counts[tool_name]-1} times. Use the results you have or finish with a done answer."})
+            continue
+
         print(f"\n[Step {step+1}] {tool_name}({', '.join(f'{k}={repr(v)[:50]}' for k,v in tool_args.items())})")
         result = TOOL_REGISTRY[tool_name]["fn"](tool_args)
 
         # Keep context lean — only last result in detail
         messages.append({"role": "assistant", "content": raw})
-        messages.append({"role": "user", "content": f"Tool result:\n{str(result)[:2000]}"})
+        messages.append({"role": "user", "content": f"Tool result:\n{str(result)[:1500]}"})
 
     return "Max steps reached"
 
