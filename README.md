@@ -1,43 +1,110 @@
 # Data Agent
 
-AI agent for web data collection, storage, and querying — powered by Groq + LLaMA.
+An AI-powered data collection, enrichment, and querying agent — built with a ReAct architecture on top of Groq + LLaMA 3.3 70B.
 
-## Features
+The agent can search the web, scrape pages, read PDFs, import Excel files, store everything in a local SQLite database, and answer natural language questions about the data — all through a simple CLI.
 
-- **Web search** via DuckDuckGo
-- **Web scraping** — fetch URLs, extract tables from HTML
-- **PDF reading** — extract text from PDF files
-- **SQLite database** — auto-creates tables, stores structured data
-- **Natural language queries** — ask questions about your data in plain language
-- **Export** — save tables to JSON or CSV
-- **CLI** — interactive or one-shot mode
+---
 
-## Folder structure
+## What Was Built
+
+### Phase 1 — Basic LLM Agent
+A minimal agent that sends user requests to an LLM and returns a text response.
+No tools, no memory, no data storage. Proof of concept only.
+
+### Phase 2 — ReAct Agent with Tools
+Replaced the basic call with a **ReAct loop** (Reasoning + Acting):
+- The LLM outputs a JSON action (`tool` + `args`)
+- The agent executes the tool and feeds the result back
+- Loop continues until the LLM outputs `{"done": true, "answer": "..."}`
+
+Tools added in this phase:
+| Tool | What it does |
+|------|-------------|
+| `search_web` | DuckDuckGo search, returns top N results |
+| `fetch_url` | Fetches a webpage and returns clean text |
+| `parse_table` | Extracts HTML tables from a URL |
+| `save_data` | Saves any JSON to `data/json/` |
+| `read_file` | Reads a JSON file from `data/json/` |
+
+### Phase 3 — SQLite Database Layer
+Added persistent structured storage so data survives between sessions:
+| Tool | What it does |
+|------|-------------|
+| `save_to_db` | Saves a list of records into a named SQLite table |
+| `list_tables` | Shows all tables in the DB with column names and row counts |
+| `query_db` | Accepts a natural language question → generates SQL → returns results |
+| `export_table` | Exports any DB table to CSV or JSON in `data/exports/` |
+
+### Phase 4 — File Import & PDF Reading
+| Tool | What it does |
+|------|-------------|
+| `import_xlsx` | Imports `.xlsx` or `.csv` from `data/csv/` into SQLite (handles metadata header rows) |
+| `read_pdf` | Extracts text from any PDF in `data/pdf/` using pdfplumber |
+| `list_data_files` | Shows all files across json/, pdf/, exports/, and DB tables |
+
+### Phase 5 — Agent Reliability Fixes
+Two bugs found and fixed during 10-test evaluation:
+- **Rate limit handling** — retry loop with 15s/30s waits on Groq 429 errors
+- **Tool repetition guard** — each tool limited to 2 calls per request to prevent loops
+
+### Phase 6 — DB-First Decision Logic
+Rewrote `SYSTEM_PROMPT` with explicit decision rules:
+1. Always check DB first before going to the web
+2. If relevant tables exist → use `query_db`, not `search_web`
+3. Only go to the web if DB has no relevant data
+4. After fetching from web → always save with `save_to_db`
+
+Additionally: the DB schema (all tables + columns + row counts) is **injected automatically** into every request before the agent starts, so it knows what data is available without needing to call `list_tables` first.
+
+---
+
+## Folder Structure
 
 ```
 data-agent/
-├── agent_with_tool.py   # Core agent + all tools
-├── cli.py               # CLI interface
+├── agent_with_tool.py   # Core agent + all 12 tools + ReAct loop
+├── cli.py               # CLI interface (interactive + one-shot mode)
+├── agent.py             # Early prototype (no tools — kept for reference)
 ├── data/
-│   ├── db/              # SQLite database
-│   ├── pdf/             # Drop PDF files here
-│   ├── json/            # Collected JSON data
-│   └── exports/         # Exported tables (CSV/JSON)
-└── .env                 # GROQ_API_KEY (not committed)
+│   ├── csv/             # Drop xlsx/csv files here for import
+│   ├── db/              # SQLite database (local only, not in git)
+│   ├── pdf/             # Drop PDF files here (local only, not in git)
+│   ├── json/            # Intermediate JSON data (local only)
+│   └── exports/         # Exported tables as CSV/JSON
+└── .env                 # API keys (never committed)
 ```
 
-## Setup
+---
 
+## Requirements
+
+### API Keys
+```
+GROQ_API_KEY=your_key_here   # Free tier: 100K tokens/day
+```
+
+### Python Dependencies
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install groq python-dotenv requests beautifulsoup4 ddgs pdfplumber
+pip install groq python-dotenv requests beautifulsoup4 ddgs pdfplumber pandas openpyxl
 ```
 
-Create a `.env` file:
+### Python Version
+Python 3.9+
+
+### Full Setup
+```bash
+git clone https://github.com/Gil-ADDA/data-agent.git
+cd data-agent
+python -m venv venv
+source venv/bin/activate        # Mac/Linux
+venv\Scripts\activate           # Windows
+pip install groq python-dotenv requests beautifulsoup4 ddgs pdfplumber pandas openpyxl
+echo "GROQ_API_KEY=your_key_here" > .env
+python cli.py
 ```
-GROQ_API_KEY=your_key_here
-```
+
+---
 
 ## Usage
 
@@ -50,60 +117,125 @@ python cli.py
 ```bash
 python cli.py "Search for top AI companies in Israel and save to database"
 python cli.py "What data do we have in the database?"
+python cli.py "Import companies.xlsx and show me the first 5 rows"
 python cli.py "Read report.pdf and save key data to the database"
 python cli.py "Export the results table to CSV"
 ```
 
+**Import an Excel file:**
+Place the file in `data/csv/` then:
+```bash
+python cli.py "Import myfile.xlsx into a table called my_table"
+```
+If the file has metadata rows before the actual headers, specify:
+```bash
+python cli.py "Import myfile.xlsx with header at row 9"
+```
+
 ---
 
-## Architecture — Is this RAG?
-
-### What we built (RAG-adjacent)
-
-The agent follows a **DB-first ReAct loop**:
+## Architecture — ReAct Loop
 
 ```
 User request
     │
     ▼
-[DB context injected] ── list of all tables sent to LLM before step 1
+[Auto-inject DB schema] — all tables + columns sent to LLM upfront
     │
     ▼
-LLM decides:
-    ├── Data exists in DB? → query_db (SQL via natural language)
-    └── No data? → search_web → save_to_db → answer
+┌─────────────────────────────────────┐
+│           ReAct Loop (max 10 steps) │
+│                                     │
+│  LLM → JSON action                  │
+│    ├── tool call → execute → result │
+│    │      └── feed result back      │
+│    └── {"done": true} → return      │
+└─────────────────────────────────────┘
+    │
+    ▼
+Decision rules (enforced in system prompt):
+  1. Data in DB? → query_db (no web search)
+  2. No data?   → search_web → save_to_db → answer
+  3. Each tool: max 2 calls per request
+  4. Rate limit: auto-retry with backoff
 ```
 
-**Tools available:** `search_web`, `fetch_url`, `parse_table`, `read_pdf`,
-`save_to_db`, `query_db`, `list_tables`, `import_xlsx`, `export_table`, `save_data`, `read_file`, `list_data_files`
+---
 
-### What RAG adds (next step)
+## Is This RAG?
 
-**RAG = Retrieval-Augmented Generation** — instead of keyword SQL search,
-the agent finds documents by *meaning*, not exact words.
+**Not quite — but close.**
 
-| | Current system | Full RAG |
+| Capability | Current System | Full RAG |
 |---|---|---|
-| Search | `WHERE description LIKE "%fleet%"` | Semantic vector search |
-| Finds | Exact keyword matches only | Conceptually similar results |
-| Storage | SQLite | Vector DB (Chroma, Pinecone) |
-| "Vehicle ops optimization" matches "fleet"? | ❌ | ✅ |
+| Data storage | SQLite (structured) | Vector DB (Chroma, Pinecone) |
+| Search method | SQL `LIKE` keyword match | Semantic / cosine similarity |
+| Finds by meaning | ❌ | ✅ |
+| Finds by exact keyword | ✅ | ✅ |
+| Works on PDFs/docs | ✅ partial | ✅ |
+| Grounded answers | ✅ | ✅ |
 
-### Steps to upgrade to full RAG
+**The gap:** searching `LIKE "%fleet%"` misses companies whose description says *"vehicle operations optimization"* — same concept, different words. RAG solves this with embeddings.
 
-**Step 1 — Embeddings**
-- Take every company description
-- Convert to a vector (array of numbers representing meaning)
-- Store in a vector database (e.g. ChromaDB locally)
+---
 
-**Step 2 — Semantic Search**
-- Incoming question → convert to vector
-- Find the N descriptions closest in meaning (cosine similarity)
+## Known Limitations
 
-**Step 3 — Generate**
-- Pass the retrieved results to the LLM → grounded answer
+| Limitation | Impact | Workaround |
+|---|---|---|
+| Groq free tier: 100K tokens/day | Rate limit on heavy use | Upgrade plan or switch to Claude API |
+| SQL search is keyword-only | Misses semantic matches | Add vector search (see Roadmap) |
+| PDF parsing: text-based only | Scanned PDFs not supported | Use OCR (Tesseract / AWS Textract) |
+| No memory between sessions | Agent forgets past conversations | Add conversation history to DB |
+| LLM sometimes ignores rules | Occasional wrong tool choice | Tune system prompt or switch model |
 
-**Tools needed:**
+---
+
+## Roadmap — Future Phases
+
+### Phase 7 — RAG / Semantic Search
+Add vector embeddings to enable meaning-based search:
 ```bash
 pip install chromadb sentence-transformers
 ```
+- Embed all company descriptions on import
+- Replace `query_db` with hybrid search (SQL filter + vector similarity)
+- Recommended model: `all-MiniLM-L6-v2` (fast, free, local)
+
+### Phase 8 — Web UI (Streamlit)
+Replace CLI with a browser-based chat interface:
+- Chat window with history
+- File upload (drag & drop xlsx/pdf)
+- Table viewer for query results
+- Export button
+
+### Phase 9 — Scheduled Data Collection
+Add cron-like jobs to keep data fresh:
+- Auto-scrape sources on a schedule
+- Detect and flag new companies vs. existing ones
+- Send summary report by email
+
+### Phase 10 — Multi-domain Knowledge Base
+Extend beyond autotech to other domains the user manages:
+- Smart Cities
+- Advanced Industry
+- Smart Transportation
+- VC Funds
+- Each domain gets its own DB schema and data pipeline
+
+### Phase 11 — Claude API Integration
+Replace Groq/LLaMA with Claude (Anthropic) for:
+- Higher quality reasoning
+- Longer context window (useful for large PDFs)
+- Better instruction following
+- Native tool-use API (no JSON parsing needed)
+
+---
+
+## Recommendations
+
+1. **Upgrade Groq plan or switch to Claude API** — the free tier blocks heavy analysis sessions
+2. **Add RAG next** — the biggest quality gap is semantic search; ChromaDB is free and local
+3. **Build Streamlit UI** — makes the tool accessible to non-technical team members
+4. **Standardize DB schema per domain** — currently tables are created ad-hoc; define a fixed schema per sector for cleaner queries
+5. **Version your data** — add `imported_at` timestamp to every table so you can track when data was added
