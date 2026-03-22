@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 import pdfplumber
+import chromadb
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
 load_dotenv()
 
@@ -21,11 +23,35 @@ DB_DIR      = os.path.join(DATA_DIR, "db")
 PDF_DIR     = os.path.join(DATA_DIR, "pdf")
 JSON_DIR    = os.path.join(DATA_DIR, "json")
 EXPORT_DIR  = os.path.join(DATA_DIR, "exports")
+VECTOR_DIR  = os.path.join(DATA_DIR, "vector")
 
-for _dir in [DB_DIR, PDF_DIR, JSON_DIR, EXPORT_DIR]:
+for _dir in [DB_DIR, PDF_DIR, JSON_DIR, EXPORT_DIR, VECTOR_DIR]:
     os.makedirs(_dir, exist_ok=True)
 
 DB_PATH = os.path.join(DB_DIR, "data_agent.db")
+
+# ── Vector DB setup ───────────────────────────────────────────────────────────
+_chroma_client     = None
+_chroma_collection = None
+_embed_fn          = None
+
+def _get_embed_fn():
+    global _embed_fn
+    if _embed_fn is None:
+        print("[RAG] Loading embedding model (first time only — ~30s)...")
+        _embed_fn = DefaultEmbeddingFunction()
+    return _embed_fn
+
+def _get_collection():
+    global _chroma_client, _chroma_collection
+    if _chroma_collection is None:
+        _chroma_client = chromadb.PersistentClient(path=VECTOR_DIR)
+        _chroma_collection = _chroma_client.get_or_create_collection(
+            name="companies",
+            embedding_function=_get_embed_fn(),
+            metadata={"hnsw:space": "cosine"}
+        )
+    return _chroma_collection
 
 # ── Tool implementations ──────────────────────────────────────────────────────
 
@@ -113,6 +139,101 @@ def list_data_files() -> str:
     conn.close()
     return json.dumps(result, ensure_ascii=False, indent=2)
 
+def build_vector_index(table_name: str = None) -> str:
+    """Embed company descriptions from DB tables into ChromaDB vector store."""
+    try:
+        collection = _get_collection()
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur  = conn.cursor()
+
+        if table_name:
+            tables = [table_name]
+        else:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall() if r[0] != "sqlite_sequence"]
+
+        total_added = 0
+        for tbl in tables:
+            cur.execute(f'PRAGMA table_info("{tbl}")')
+            cols = [r[1] for r in cur.fetchall()]
+
+            name_col = next((c for c in cols if c.lower() in
+                             ["short name", "name", "company english name", "company hebrew name"]), None)
+            desc_col = next((c for c in cols if "description" in c.lower()), None)
+
+            if not name_col or not desc_col:
+                continue
+
+            cur.execute(f'SELECT "{name_col}", "{desc_col}" FROM "{tbl}"')
+            rows = cur.fetchall()
+
+            docs, ids, metas = [], [], []
+            for row in rows:
+                name = str(row[0] or "").strip()
+                desc = str(row[1] or "").strip()
+                if not name or not desc or desc == "None":
+                    continue
+                import hashlib
+                doc_id = hashlib.md5(f"{tbl}_{name}".encode()).hexdigest()
+                docs.append(f"{name}: {desc}")
+                ids.append(doc_id)
+                metas.append({"name": name, "table": tbl, "description": desc[:500]})
+
+            if not docs:
+                continue
+
+            # Upsert in batches of 100 — ChromaDB handles embeddings internally
+            for i in range(0, len(docs), 100):
+                collection.upsert(
+                    ids=ids[i:i+100],
+                    documents=docs[i:i+100],
+                    metadatas=metas[i:i+100]
+                )
+                print(f"  [RAG] Indexed {min(i+100, len(docs))}/{len(docs)} from '{tbl}'")
+            total_added += len(docs)
+
+        conn.close()
+        return f"Vector index built: {total_added} documents indexed from {len(tables)} table(s)"
+    except Exception as e:
+        return f"Error building vector index: {str(e)}"
+
+
+def semantic_search(query: str, n_results: int = 10) -> str:
+    """Search company descriptions by meaning using vector similarity."""
+    try:
+        collection = _get_collection()
+
+        if collection.count() == 0:
+            return "Vector index is empty. Run build_vector_index first."
+
+        results = collection.query(
+            query_texts=[query],
+            n_results=min(n_results, collection.count()),
+            include=["documents", "metadatas", "distances"]
+        )
+
+        output = []
+        for i, (doc, meta, dist) in enumerate(zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0]
+        )):
+            similarity = round((1 - dist) * 100, 1)
+            output.append({
+                "rank": i + 1,
+                "name": meta.get("name", ""),
+                "table": meta.get("table", ""),
+                "similarity_%": similarity,
+                "description": meta.get("description", "")[:200]
+            })
+
+        return json.dumps(output, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"Error in semantic search: {str(e)}"
+
+
 def import_xlsx(filename: str, table_name: str = None, header_row: int = 0) -> str:
     """Import an xlsx/csv file from data/csv/ directly into SQLite"""
     try:
@@ -139,6 +260,8 @@ def import_xlsx(filename: str, table_name: str = None, header_row: int = 0) -> s
         conn = sqlite3.connect(DB_PATH)
         df.to_sql(table_name, conn, if_exists='replace', index=False)
         conn.close()
+        # Auto-build vector index for this table
+        build_vector_index(table_name)
         return f"Imported {len(df)} rows, {len(df.columns)} columns into table '{table_name}'\nColumns: {list(df.columns)}"
     except Exception as e:
         return f"Error importing file: {str(e)}"
@@ -292,6 +415,14 @@ TOOL_REGISTRY = {
         "fn": lambda args: import_xlsx(args["filename"], args.get("table_name"), args.get("header_row", 0)),
         "desc": 'import_xlsx(filename, table_name, header_row=0) → Import xlsx/csv from data/csv/ into SQLite'
     },
+    "semantic_search": {
+        "fn": lambda args: semantic_search(args["query"], args.get("n_results", 10)),
+        "desc": 'semantic_search(query, n_results=10) → Search companies by meaning (not just keywords) using vector similarity'
+    },
+    "build_vector_index": {
+        "fn": lambda args: build_vector_index(args.get("table_name")),
+        "desc": 'build_vector_index(table_name=None) → Embed all company descriptions into vector DB (run once, or after new imports)'
+    },
 }
 
 
@@ -310,12 +441,14 @@ When you have finished and have an answer for the user, output EXACTLY:
 
 ## Decision rules — follow this order every time:
 
-1. ALWAYS call list_tables first if the request is about data, companies, funds, or analysis.
-2. If relevant tables exist → use query_db to answer from the database. Do NOT search the web.
-3. Only use search_web or fetch_url if:
+1. ALWAYS check the DB context provided before taking any action.
+2. For conceptual or descriptive questions ("companies that solve X", "who works on Y") → use semantic_search FIRST.
+3. For structured queries (filters, counts, specific fields) → use query_db.
+4. Only use search_web or fetch_url if:
    - The database has no relevant data, AND
    - The user explicitly asks for new/live information from the internet.
-4. After fetching new data from the web → always save it with save_to_db for future use.
+5. After fetching new data from the web → always save it with save_to_db for future use.
+6. If vector index seems empty or outdated → call build_vector_index before semantic_search.
 
 ## Output rules:
 - Output ONLY valid JSON, one object per response
