@@ -11,7 +11,8 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 import pdfplumber
 import chromadb
-from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+from sentence_transformers import SentenceTransformer
+from chromadb import EmbeddingFunction, Embeddings
 
 load_dotenv()
 
@@ -30,24 +31,35 @@ for _dir in [DB_DIR, PDF_DIR, JSON_DIR, EXPORT_DIR, VECTOR_DIR]:
 
 DB_PATH = os.path.join(DB_DIR, "data_agent.db")
 
-# ── Vector DB setup ───────────────────────────────────────────────────────────
+# ── Vector DB setup (multilingual model — Hebrew + English) ───────────────────
+EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+
 _chroma_client     = None
 _chroma_collection = None
 _embed_fn          = None
 
+class MultilingualEmbedder(EmbeddingFunction):
+    """Wraps sentence-transformers for ChromaDB — supports Hebrew + English."""
+    def __init__(self):
+        print(f"[RAG] Loading multilingual model '{EMBEDDING_MODEL}' (first time only)...")
+        self._model = SentenceTransformer(EMBEDDING_MODEL)
+
+    def __call__(self, input: list) -> Embeddings:
+        return self._model.encode(input, normalize_embeddings=True).tolist()
+
 def _get_embed_fn():
     global _embed_fn
     if _embed_fn is None:
-        print("[RAG] Loading embedding model (first time only — ~30s)...")
-        _embed_fn = DefaultEmbeddingFunction()
+        _embed_fn = MultilingualEmbedder()
     return _embed_fn
 
 def _get_collection():
     global _chroma_client, _chroma_collection
     if _chroma_collection is None:
         _chroma_client = chromadb.PersistentClient(path=VECTOR_DIR)
+        # Use a versioned collection name so old English-only index is replaced
         _chroma_collection = _chroma_client.get_or_create_collection(
-            name="companies",
+            name="companies_v2",
             embedding_function=_get_embed_fn(),
             metadata={"hnsw:space": "cosine"}
         )
