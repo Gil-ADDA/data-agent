@@ -191,51 +191,102 @@ Decision rules (enforced in system prompt):
 
 ---
 
-## Roadmap — Future Phases
+## Roadmap — Build Phases
 
-### Phase 7 — RAG / Semantic Search
-Add vector embeddings to enable meaning-based search:
-```bash
-pip install chromadb sentence-transformers
-```
-- Embed all company descriptions on import
-- Replace `query_db` with hybrid search (SQL filter + vector similarity)
-- Recommended model: `all-MiniLM-L6-v2` (fast, free, local)
+### ✅ Phase 7 — RAG / Semantic Search (COMPLETED)
+- ChromaDB as persistent vector store (`data/vector/`)
+- `paraphrase-multilingual-MiniLM-L12-v2` — supports Hebrew + English
+- Auto-translation: Hebrew queries → English before search (transparent)
+- 1,462 documents indexed from 12 DB tables
+- Auto-index rebuild on every `import_xlsx`
+- Tools added: `semantic_search`, `build_vector_index`
 
 ### Phase 8 — Web UI (Streamlit)
 Replace CLI with a browser-based chat interface:
-- Chat window with history
+- Chat window with conversation history
 - File upload (drag & drop xlsx/pdf)
-- Table viewer for query results
-- Export button
+- Table viewer for query results with export button
+- Sidebar showing DB tables and vector index status
 
 ### Phase 9 — Scheduled Data Collection
-Add cron-like jobs to keep data fresh:
-- Auto-scrape sources on a schedule
-- Detect and flag new companies vs. existing ones
-- Send summary report by email
+Keep data fresh automatically:
+- Cron-like jobs to re-scrape sources on a schedule
+- Detect new companies vs. existing ones (delta updates)
+- Weekly email/Slack summary report
 
 ### Phase 10 — Multi-domain Knowledge Base
-Extend beyond autotech to other domains the user manages:
-- Smart Cities
-- Advanced Industry
-- Smart Transportation
-- VC Funds
-- Each domain gets its own DB schema and data pipeline
+Extend beyond autotech:
+- Smart Cities, Smart Transportation, Advanced Industry, VC Funds
+- Each domain: dedicated DB schema + vector collection
+- Domain routing: agent detects which domain the question is about
 
 ### Phase 11 — Claude API Integration
 Replace Groq/LLaMA with Claude (Anthropic) for:
-- Higher quality reasoning
-- Longer context window (useful for large PDFs)
-- Better instruction following
-- Native tool-use API (no JSON parsing needed)
+- Higher quality reasoning and instruction following
+- Longer context window (better for large PDFs)
+- Native tool-use API (no JSON parsing workaround)
+- Multilingual understanding without translation step
+
+---
+
+## Continuous Improvement — How to Get Better Results
+
+The system is designed to be improved iteratively. If results are not satisfactory, follow this process:
+
+### Step 1 — Diagnose the problem
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| Results are irrelevant | Query too vague | Use more specific English terms |
+| Missing companies | Not in DB | Import missing data source |
+| Wrong companies returned | Descriptions too short | Enrich DB with fuller descriptions |
+| Similarity scores too low (<50%) | Topic not well represented | Add more data on that topic |
+| Semantic search and SQL disagree | Use both and compare | Run `query_db` + `semantic_search` and merge |
+
+### Step 2 — Improve the data
+```bash
+# Add new xlsx/pdf files to data/csv/ or data/pdf/
+python cli.py "Import newfile.xlsx into table new_table"
+# Index is rebuilt automatically
+```
+
+### Step 3 — Improve the query
+```bash
+# Bad (too short):
+python cli.py "fleet companies"
+
+# Good (descriptive):
+python cli.py "companies that provide fleet management, vehicle tracking, and telematics solutions for commercial vehicles"
+```
+
+### Step 4 — Tune search results
+```bash
+# Increase result count to see more candidates
+python cli.py "semantic_search fleet management 20"
+
+# Combine with SQL filter for precision
+python cli.py "from semantic search results on fleet management, show only companies with more than 50 employees"
+```
+
+### Step 5 — Upgrade the model (when ready)
+Current model: `paraphrase-multilingual-MiniLM-L12-v2` (fast, local, free)
+
+Better alternatives (require more RAM/compute):
+| Model | Size | Quality | Languages |
+|-------|------|---------|-----------|
+| `paraphrase-multilingual-MiniLM-L12-v2` | 120MB | Good | 50+ |
+| `paraphrase-multilingual-mpnet-base-v2` | 280MB | Better | 50+ |
+| OpenAI `text-embedding-3-small` | API | Best | All |
+| Claude Embeddings | API | Best | All |
+
+To switch model: change `EMBEDDING_MODEL` in `agent_with_tool.py`, delete `data/vector/`, run `build_vector_index`.
 
 ---
 
 ## Recommendations
 
-1. **Upgrade Groq plan or switch to Claude API** — the free tier blocks heavy analysis sessions
-2. **Add RAG next** — the biggest quality gap is semantic search; ChromaDB is free and local
-3. **Build Streamlit UI** — makes the tool accessible to non-technical team members
-4. **Standardize DB schema per domain** — currently tables are created ad-hoc; define a fixed schema per sector for cleaner queries
-5. **Version your data** — add `imported_at` timestamp to every table so you can track when data was added
+1. **Switch to Claude API** — better reasoning, longer context, native tools (no JSON workaround)
+2. **Build Streamlit UI** — makes the tool accessible without terminal
+3. **Standardize DB schema per domain** — define fixed columns per sector for cleaner queries
+4. **Add `imported_at` timestamp** — track when data was added for freshness monitoring
+5. **Run `build_vector_index` after every manual DB change** — keeps semantic search in sync
+6. **If results are bad → diagnose before changing code** — follow the Continuous Improvement steps above
