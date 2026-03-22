@@ -212,16 +212,43 @@ def build_vector_index(table_name: str = None) -> str:
         return f"Error building vector index: {str(e)}"
 
 
+def _is_hebrew(text: str) -> bool:
+    """Returns True if the text contains Hebrew characters."""
+    return any('\u05d0' <= c <= '\u05ea' for c in text)
+
+
+def _translate_to_english(hebrew_query: str) -> str:
+    """Translate a Hebrew query to English using the LLM."""
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a translator. Translate the user's Hebrew search query to English. Output ONLY the English translation — no explanations, no quotes, no punctuation at the end."},
+            {"role": "user", "content": hebrew_query}
+        ],
+        temperature=0
+    )
+    return response.choices[0].message.content.strip()
+
+
 def semantic_search(query: str, n_results: int = 10) -> str:
-    """Search company descriptions by meaning using vector similarity."""
+    """Search company descriptions by meaning using vector similarity.
+    Automatically translates Hebrew queries to English before searching."""
     try:
         collection = _get_collection()
 
         if collection.count() == 0:
             return "Vector index is empty. Run build_vector_index first."
 
+        # Auto-translate Hebrew queries
+        search_query = query
+        translation_note = ""
+        if _is_hebrew(query):
+            search_query = _translate_to_english(query)
+            translation_note = f"[🔤 Translated: \"{query}\" → \"{search_query}\"]"
+            print(f"\n{translation_note}")
+
         results = collection.query(
-            query_texts=[query],
+            query_texts=[search_query],
             n_results=min(n_results, collection.count()),
             include=["documents", "metadatas", "distances"]
         )
@@ -241,7 +268,11 @@ def semantic_search(query: str, n_results: int = 10) -> str:
                 "description": meta.get("description", "")[:200]
             })
 
-        return json.dumps(output, ensure_ascii=False, indent=2)
+        result_json = json.dumps(output, ensure_ascii=False, indent=2)
+        if translation_note:
+            return f"{translation_note}\n{result_json}"
+        return result_json
+
     except Exception as e:
         return f"Error in semantic search: {str(e)}"
 
