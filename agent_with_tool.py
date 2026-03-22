@@ -309,6 +309,130 @@ def import_xlsx(filename: str, table_name: str = None, header_row: int = 0) -> s
     except Exception as e:
         return f"Error importing file: {str(e)}"
 
+def smart_import(filename: str, table_name: str, key_column: str, header_row: int = 0) -> str:
+    """
+    Safely import a file into an existing table with deduplication.
+    - key_column: the column used to identify duplicates (e.g. 'Reg Number', 'name')
+    - Skips rows that already exist (exact key match)
+    - Updates rows that exist but have empty fields filled in
+    - Adds rows that are completely new
+    - Never deletes existing data
+    """
+    try:
+        import warnings
+        warnings.filterwarnings('ignore')
+
+        CSV_DIR = os.path.join(DATA_DIR, "csv")
+        files   = os.listdir(CSV_DIR)
+        match   = next((f for f in files if filename.lower() in f.lower()), None)
+        if not match:
+            return f"File not found. Available: {', '.join(files)}"
+
+        path = os.path.join(CSV_DIR, match)
+        ext  = os.path.splitext(match)[1].lower()
+        if ext in (".xlsx", ".xls"):
+            new_df = pd.read_excel(path, header=header_row)
+        else:
+            new_df = pd.read_csv(path, header=header_row)
+
+        new_df = new_df.dropna(how='all').reset_index(drop=True)
+        new_df.columns = [str(c).strip() for c in new_df.columns]
+
+        if key_column not in new_df.columns:
+            return f"Key column '{key_column}' not found. Available columns: {list(new_df.columns)}"
+
+        conn = sqlite3.connect(DB_PATH)
+
+        # Check if table exists
+        existing_tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)['name'].tolist()
+        if table_name not in existing_tables:
+            # Table doesn't exist yet — just import everything
+            new_df.to_sql(table_name, conn, if_exists='replace', index=False)
+            conn.close()
+            build_vector_index(table_name)
+            return f"Table '{table_name}' created with {len(new_df)} rows (first import)."
+
+        # Load existing data
+        existing_df = pd.read_sql(f'SELECT * FROM "{table_name}"', conn)
+
+        # Normalize key column for comparison
+        existing_keys = existing_df[key_column].astype(str).str.strip().str.lower()
+        new_keys      = new_df[key_column].astype(str).str.strip().str.lower()
+
+        added    = []
+        updated  = []
+        skipped  = []
+
+        for _, row in new_df.iterrows():
+            row_key = str(row[key_column]).strip().lower()
+
+            if row_key not in existing_keys.values or row_key in ('', 'nan', 'none'):
+                # Completely new — add it
+                added.append(row)
+            else:
+                # Exists — check if incoming row fills any empty fields
+                idx = existing_keys[existing_keys == row_key].index[0]
+                existing_row = existing_df.loc[idx]
+                enriched = False
+                for col in new_df.columns:
+                    if col in existing_df.columns:
+                        existing_val = str(existing_row.get(col, '')).strip()
+                        new_val      = str(row.get(col, '')).strip()
+                        if (not existing_val or existing_val in ('nan', 'None', '')) and \
+                           new_val and new_val not in ('nan', 'None', ''):
+                            existing_df.at[idx, col] = row[col]
+                            enriched = True
+                if enriched:
+                    updated.append(row_key)
+                else:
+                    skipped.append(row_key)
+
+        # Append new rows
+        if added:
+            added_df = pd.DataFrame(added)
+            # Align columns
+            for col in existing_df.columns:
+                if col not in added_df.columns:
+                    added_df[col] = None
+            existing_df = pd.concat([existing_df, added_df[existing_df.columns]], ignore_index=True)
+
+        # Save back
+        existing_df.to_sql(table_name, conn, if_exists='replace', index=False)
+        conn.close()
+
+        # Rebuild vector index
+        build_vector_index(table_name)
+
+        # Save audit report
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report = {
+            "file": filename,
+            "table": table_name,
+            "key_column": key_column,
+            "timestamp": ts,
+            "added":   len(added),
+            "updated": len(updated),
+            "skipped": len(skipped),
+            "total_in_file": len(new_df),
+            "total_in_table_after": len(existing_df),
+        }
+        report_path = os.path.join(EXPORT_DIR, f"import_report_{ts}.json")
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+        return (
+            f"Smart import complete for '{table_name}':\n"
+            f"  ✅ Added:   {len(added)} new rows\n"
+            f"  🔄 Updated: {len(updated)} rows (empty fields filled)\n"
+            f"  ⏭️  Skipped: {len(skipped)} rows (already complete)\n"
+            f"  📊 Total in table: {len(existing_df)}\n"
+            f"  📄 Report saved: {report_path}"
+        )
+
+    except Exception as e:
+        return f"Error in smart_import: {str(e)}"
+
+
 def export_table(table_name: str, fmt: str = "json") -> str:
     """Export a DB table to data/exports/ as JSON or CSV"""
     try:
@@ -456,7 +580,11 @@ TOOL_REGISTRY = {
     },
     "import_xlsx": {
         "fn": lambda args: import_xlsx(args["filename"], args.get("table_name"), args.get("header_row", 0)),
-        "desc": 'import_xlsx(filename, table_name, header_row=0) → Import xlsx/csv from data/csv/ into SQLite'
+        "desc": 'import_xlsx(filename, table_name, header_row=0) → Import xlsx/csv from data/csv/ into SQLite (replaces table)'
+    },
+    "smart_import": {
+        "fn": lambda args: smart_import(args["filename"], args["table_name"], args["key_column"], args.get("header_row", 0)),
+        "desc": 'smart_import(filename, table_name, key_column, header_row=0) → Safe import with deduplication: adds new rows, updates partial rows, skips complete duplicates. Use instead of import_xlsx when table already has data.'
     },
     "semantic_search": {
         "fn": lambda args: semantic_search(args["query"], args.get("n_results", 10)),
